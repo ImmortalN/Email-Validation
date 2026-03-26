@@ -1,7 +1,7 @@
 {
   "name": "intercom-email-verifier",
   "version": "1.0.0",
-  "description": "Тихая проверка email через Cloudflare Worker и обновление атрибутов в Intercom",
+  "description": "Тихая проверка email через Cloudflare Worker",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
