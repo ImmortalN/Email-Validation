@@ -4,9 +4,9 @@ const app = express();
 
 app.use(express.json());
 
-// === НАСТРОЙКИ (добавь их в Environment Variables на Render) ===
+// === НАСТРОЙКИ (Environment Variables на Render) ===
 const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
-const WORKER_URL = process.env.WORKER_URL;   // пример: https://royal-dream-d217.immortal-333.workers.dev/?email=
+const WORKER_URL = process.env.WORKER_URL;   // обязательно: https://royal-dream-d217.immortal-333.workers.dev/?email=
 const INTERCOM_VERSION = process.env.INTERCOM_VERSION || '2.14';
 
 if (!INTERCOM_TOKEN || !WORKER_URL) {
@@ -14,9 +14,9 @@ if (!INTERCOM_TOKEN || !WORKER_URL) {
     process.exit(1);
 }
 
-console.log('✅ Intercom Email Verifier запущен');
+console.log('✅ Intercom Email Verifier запущен (с автоматической проверкой при conversation.user.created)');
 
-// === ОСНОВНАЯ ФУНКЦИЯ ПРОВЕРКИ И ОБНОВЛЕНИЯ ===
+// === ОСНОВНАЯ ФУНКЦИЯ ПРОВЕРКИ ===
 async function verifyAndUpdateContact(contactId, email, purchaseEmail = null) {
     if (!contactId) {
         console.error('contactId не передан');
@@ -27,25 +27,23 @@ async function verifyAndUpdateContact(contactId, email, purchaseEmail = null) {
     let hasSubscription = false;
 
     try {
-        // 1. Проверяем дефолтный email
         if (email) {
-            console.log(`Проверяем основной email: ${email}`);
+            console.log(`[Проверка] Основной email: ${email}`);
             const res = await axios.get(WORKER_URL + encodeURIComponent(email), { timeout: 10000 });
             const data = res.data;
             exists = data.exists === true;
             hasSubscription = data.valid === true;
         }
 
-        // 2. Если не нашли — проверяем Purchase Email
         if (!exists && purchaseEmail) {
-            console.log(`Проверяем Purchase Email: ${purchaseEmail}`);
+            console.log(`[Проверка] Purchase Email: ${purchaseEmail}`);
             const res2 = await axios.get(WORKER_URL + encodeURIComponent(purchaseEmail), { timeout: 10000 });
             const data2 = res2.data;
             exists = data2.exists === true;
             hasSubscription = data2.valid === true;
         }
 
-        // 3. Обновляем атрибуты в Intercom
+        // Обновляем атрибуты
         await axios.put(`https://api.intercom.io/contacts/${contactId}`, {
             custom_attributes: {
                 'User exists': exists,
@@ -61,34 +59,45 @@ async function verifyAndUpdateContact(contactId, email, purchaseEmail = null) {
             timeout: 8000
         });
 
-        console.log(`✅ Успешно обновлено для контакта ${contactId} → User exists: ${exists}, Has active subscription: ${hasSubscription}`);
+        console.log(`✅ Атрибуты обновлены для контакта ${contactId} → User exists: ${exists}, Has active subscription: ${hasSubscription}`);
 
     } catch (error) {
-        console.error(`❌ Ошибка при обработке контакта ${contactId}:`, 
-            error.response?.data || error.message);
+        console.error(`❌ Ошибка для контакта ${contactId}:`, error.response?.status, error.response?.data || error.message);
     }
 }
 
-// === ЭНДПОИНТ ДЛЯ ТЕСТА И ДЛЯ WEBHOOK ===
-app.post('/verify-email', async (req, res) => {
-    const { contact_id, email, purchase_email } = req.body;
+// === НОВЫЙ ЭНДПОИНТ ДЛЯ WEBHOOK ===
+app.post('/webhook', async (req, res) => {
+    const body = req.body;
+    const topic = body.topic;
+    const item = body.data?.item;
 
-    if (!contact_id) {
-        return res.status(400).json({ error: 'contact_id обязателен' });
+    if (!item) {
+        return res.status(200).json({ ok: true });
     }
 
-    // Запускаем проверку асинхронно, чтобы быстро вернуть ответ
-    verifyAndUpdateContact(contact_id, email, purchase_email);
+    // Автоматическая проверка при начале нового чата
+    if (topic === 'conversation.user.created') {
+        const contactId = item.contacts?.[0]?.id || item.user?.id;
+        const email = item.contacts?.[0]?.email || item.user?.email;
+        const purchaseEmail = item.contacts?.[0]?.custom_attributes?.['Purchase Email'] 
+                           || item.custom_attributes?.['Purchase Email'];
 
-    res.status(200).json({ 
-        ok: true, 
-        message: 'Проверка запущена. Атрибуты обновятся только у этого контакта.' 
-    });
+        if (contactId) {
+            console.log(`[Webhook] Новый чат начат → запускаем проверку для contact ${contactId}`);
+            verifyAndUpdateContact(contactId, email, purchaseEmail);
+        }
+    }
+
+    // Можно добавить и на conversation.user.replied, если хочешь проверять при каждом ответе клиента
+    // if (topic === 'conversation.user.replied') { ... }
+
+    res.status(200).json({ ok: true });
 });
 
-// === Health check ===
+// Health check
 app.get('/', (req, res) => {
-    res.send('✅ Intercom Email Verifier работает. Используй POST /verify-email');
+    res.send('✅ Email Verifier работает. Webhook: /webhook');
 });
 
 app.listen(process.env.PORT || 3000, () => {
