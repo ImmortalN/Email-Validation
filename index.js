@@ -8,8 +8,11 @@ const WORKER_URL = process.env.WORKER_URL;
 const INTERCOM_VERSION = '2.14';
 const DEBUG = process.env.DEBUG === 'true' || process.env.DEBUG === '1';
 
+// Хранилище проверенных чатов (чтобы не проверять на каждое сообщение в одной беседе)
+const checkedConversations = new Set();
+
 if (!INTERCOM_TOKEN || !WORKER_URL) {
-    console.error('ОШИБКА: Проверьте INTERCOM_TOKEN и WORKER_URL!');
+    console.error('ОШИБКА: Проверьте переменные окружения!');
     process.exit(1);
 }
 
@@ -20,7 +23,7 @@ function log(...args) {
 async function getVerificationFromWorker(email) {
     if (!email) return { exists: false, valid: false };
     try {
-        log(`Отправляю запрос воркеру для: ${email}`);
+        log(`Запрос к воркеру для: ${email}`);
         const url = WORKER_URL.includes('?') ? `${WORKER_URL}${encodeURIComponent(email)}` : `${WORKER_URL}?email=${encodeURIComponent(email)}`;
         const res = await axios.get(url, { timeout: 10000 });
         return {
@@ -33,11 +36,17 @@ async function getVerificationFromWorker(email) {
     }
 }
 
-async function verifyContact(contactId) {
+async function verifyContact(contactId, conversationId) {
     if (!contactId) return;
 
+    // Если мы уже проверяли этот конкретный чат в текущей сессии сервера — выходим
+    if (conversationId && checkedConversations.has(conversationId)) {
+        log(`Чат ${conversationId} уже проверен в этой сессии. Пропускаю повтор.`);
+        return;
+    }
+
     try {
-        log(`--- Начинаю проверку контакта ${contactId} ---`);
+        log(`--- Запуск проверки для контакта ${contactId} (Чат: ${conversationId}) ---`);
 
         const contactRes = await axios.get(`https://api.intercom.io/contacts/${contactId}`, {
             headers: {
@@ -50,45 +59,23 @@ async function verifyContact(contactId) {
         const contact = contactRes.data;
         const attrs = contact.custom_attributes || {};
 
-        // 1. ЛОГИРУЕМ ВСЕ АТРИБУТЫ (чтобы найти точное имя Purchase Email)
-        log(`Все кастомные атрибуты контакта:`, JSON.stringify(attrs));
-
-        // 2. ЗАЩИТА (Стоп-кран)
-        // Если уже стоит true или false — выходим
-        if (attrs['User exists'] !== null && attrs['User exists'] !== undefined) {
-            log(`Контакт уже проверен (User exists = ${attrs['User exists']}). Пропускаю.`);
-            return;
-        }
-
-        // 3. ПОИСК ПРАВИЛЬНОГО EMAIL
         const defaultEmail = contact.email;
-        // Пробуем разные варианты написания, которые могут быть в Intercom
-        const purchaseEmail = attrs['Purchase Email'] || 
-                             attrs['Purchase email'] || 
-                             attrs['purchase_email'] || 
-                             attrs['purchase email'];
-
-        log(`Найденные имейлы: Default=${defaultEmail || 'нет'}, Purchase=${purchaseEmail || 'нет'}`);
+        const purchaseEmail = attrs['Purchase email'] || attrs['Purchase Email'] || attrs['purchase_email'];
 
         let finalResult = { exists: false, valid: false };
 
-        // 4. ПРОВЕРКА №1: Default Email
+        // Шаг 1: Основной имейл
         if (defaultEmail) {
-            log(`Шаг 1: Проверяю Default Email...`);
             finalResult = await getVerificationFromWorker(defaultEmail);
         }
 
-        // 5. ПРОВЕРКА №2: Purchase Email (если первый не найден)
+        // Шаг 2: Purchase имейл (если основной не дал exists: true)
         if (!finalResult.exists && purchaseEmail) {
-            log(`Шаг 2: Default не найден. Проверяю Purchase Email: ${purchaseEmail}`);
+            log(`Default email не найден. Проверяю Purchase Email: ${purchaseEmail}`);
             finalResult = await getVerificationFromWorker(purchaseEmail);
-        } else if (!purchaseEmail) {
-            log(`Шаг 2: Purchase Email не найден в профиле юзера.`);
         }
 
-        // 6. ОБНОВЛЕНИЕ
-        log(`Финальный результат для отправки: Exists=${finalResult.exists}, Valid=${finalResult.valid}`);
-
+        // Шаг 3: Обновление Intercom
         await axios.put(`https://api.intercom.io/contacts/${contactId}`, {
             custom_attributes: {
                 'User exists': finalResult.exists,
@@ -102,32 +89,40 @@ async function verifyContact(contactId) {
             }
         });
 
-        console.log(`✅ Успешно обновлено для ${contactId}`);
+        // Запоминаем, что этот чат мы обработали
+        if (conversationId) {
+            checkedConversations.add(conversationId);
+            // Чтобы память не переполнялась, удаляем старые ID через 24 часа (опционально)
+            setTimeout(() => checkedConversations.delete(conversationId), 24 * 60 * 60 * 1000);
+        }
+
+        console.log(`✅ Контакт ${contactId} актуализирован. Exists: ${finalResult.exists}, Sub: ${finalResult.valid}`);
 
     } catch (e) {
-        console.error(`❌ Ошибка в verifyContact:`, e.response?.data || e.message);
+        console.error(`❌ Ошибка:`, e.response?.data || e.message);
     }
 }
 
 app.post('/validate-email', (req, res) => {
     res.status(200).json({ ok: true });
 
-    const item = req.body.data?.item;
+    const body = req.body;
+    const item = body.data?.item;
     if (!item) return;
 
+    const conversationId = item.id; // ID текущего чата
     const contactId = item.user?.id || 
                       item.contacts?.contacts?.[0]?.id || 
                       item.author?.id || 
                       (item.type === 'contact' ? item.id : null);
 
     if (contactId) {
-        log(`Webhook: ${req.body.topic} для ${contactId}`);
-        verifyContact(contactId);
+        verifyContact(contactId, conversationId);
     }
 });
 
-app.get('/', (req, res) => res.send('Verifier v5 is running'));
+app.get('/', (req, res) => res.send('Verifier v6: Per-Conversation Mode'));
 
 app.listen(process.env.PORT || 3000, () => {
-    console.log(`🚀 Сервер на связи`);
+    console.log(`🚀 Сервер запущен. Режим проверки каждого нового чата.`);
 });
