@@ -3,26 +3,24 @@ const axios = require('axios');
 const app = express();
 app.use(express.json());
 
-// === ПЕРЕМЕННЫЕ (Берем из Render) ===
 const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
-const WORKER_URL = process.env.WORKER_URL; // Должен быть https://.../email=
+const WORKER_URL = process.env.WORKER_URL; 
 const INTERCOM_VERSION = '2.14';
 const DEBUG = process.env.DEBUG === 'true' || process.env.DEBUG === '1';
 
 if (!INTERCOM_TOKEN || !WORKER_URL) {
-    console.error('ОШИБКА: INTERCOM_TOKEN или WORKER_URL не заданы!');
+    console.error('ОШИБКА: Проверьте INTERCOM_TOKEN и WORKER_URL!');
     process.exit(1);
 }
 
 function log(...args) {
-    if (DEBUG) console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...args);
+    if (DEBUG) console.log(`[LOG]`, ...args);
 }
 
-// === ФУНКЦИЯ ПРОВЕРКИ ЧЕРЕЗ WORKER ===
-async function checkEmail(email) {
+async function getVerificationFromWorker(email) {
     if (!email) return { exists: false, valid: false };
     try {
-        log(`Проверка в таблице: ${email}`);
+        log(`Отправляю запрос воркеру для: ${email}`);
         const url = WORKER_URL.includes('?') ? `${WORKER_URL}${encodeURIComponent(email)}` : `${WORKER_URL}?email=${encodeURIComponent(email)}`;
         const res = await axios.get(url, { timeout: 10000 });
         return {
@@ -35,12 +33,12 @@ async function checkEmail(email) {
     }
 }
 
-// === ОСНОВНАЯ ЛОГИКА ===
-async function validateAndVerifyContact(contactId) {
+async function verifyContact(contactId) {
     if (!contactId) return;
 
     try {
-        // 1. Получаем данные контакта
+        log(`--- Начинаю проверку контакта ${contactId} ---`);
+
         const contactRes = await axios.get(`https://api.intercom.io/contacts/${contactId}`, {
             headers: {
                 'Authorization': `Bearer ${INTERCOM_TOKEN}`,
@@ -52,35 +50,49 @@ async function validateAndVerifyContact(contactId) {
         const contact = contactRes.data;
         const attrs = contact.custom_attributes || {};
 
-        // Проверяем, не установлены ли уже атрибуты, чтобы не гонять код зря
-        if (attrs['User exists'] !== undefined && attrs['User exists'] !== null) {
-            log(`Контакт ${contactId} уже проверен ранее. Пропускаю.`);
+        // 1. ЛОГИРУЕМ ВСЕ АТРИБУТЫ (чтобы найти точное имя Purchase Email)
+        log(`Все кастомные атрибуты контакта:`, JSON.stringify(attrs));
+
+        // 2. ЗАЩИТА (Стоп-кран)
+        // Если уже стоит true или false — выходим
+        if (attrs['User exists'] !== null && attrs['User exists'] !== undefined) {
+            log(`Контакт уже проверен (User exists = ${attrs['User exists']}). Пропускаю.`);
             return;
         }
 
-        const email = contact.email;
-        const purchaseEmail = attrs['Purchase Email'] || attrs['purchase_email'];
+        // 3. ПОИСК ПРАВИЛЬНОГО EMAIL
+        const defaultEmail = contact.email;
+        // Пробуем разные варианты написания, которые могут быть в Intercom
+        const purchaseEmail = attrs['Purchase Email'] || 
+                             attrs['Purchase email'] || 
+                             attrs['purchase_email'] || 
+                             attrs['purchase email'];
 
-        log(`Данные контакта ${contactId}: email=${email}, purchaseEmail=${purchaseEmail}`);
+        log(`Найденные имейлы: Default=${defaultEmail || 'нет'}, Purchase=${purchaseEmail || 'нет'}`);
 
-        let result = { exists: false, valid: false };
+        let finalResult = { exists: false, valid: false };
 
-        // 2. Сначала проверяем основной email
-        if (email) {
-            result = await checkEmail(email);
+        // 4. ПРОВЕРКА №1: Default Email
+        if (defaultEmail) {
+            log(`Шаг 1: Проверяю Default Email...`);
+            finalResult = await getVerificationFromWorker(defaultEmail);
         }
 
-        // 3. Если не нашли, проверяем Purchase Email
-        if (!result.exists && purchaseEmail) {
-            log(`Основной email не найден, пробуем Purchase Email...`);
-            result = await checkEmail(purchaseEmail);
+        // 5. ПРОВЕРКА №2: Purchase Email (если первый не найден)
+        if (!finalResult.exists && purchaseEmail) {
+            log(`Шаг 2: Default не найден. Проверяю Purchase Email: ${purchaseEmail}`);
+            finalResult = await getVerificationFromWorker(purchaseEmail);
+        } else if (!purchaseEmail) {
+            log(`Шаг 2: Purchase Email не найден в профиле юзера.`);
         }
 
-        // 4. Обновляем Intercom
+        // 6. ОБНОВЛЕНИЕ
+        log(`Финальный результат для отправки: Exists=${finalResult.exists}, Valid=${finalResult.valid}`);
+
         await axios.put(`https://api.intercom.io/contacts/${contactId}`, {
             custom_attributes: {
-                'User exists': result.exists,
-                'Has active subscription': result.valid
+                'User exists': finalResult.exists,
+                'Has active subscription': finalResult.valid
             }
         }, {
             headers: {
@@ -90,41 +102,32 @@ async function validateAndVerifyContact(contactId) {
             }
         });
 
-        console.log(`✅ Обновлено ${contactId}: Exists=${result.exists}, Sub=${result.valid}`);
+        console.log(`✅ Успешно обновлено для ${contactId}`);
 
     } catch (e) {
-        console.error(`[ERROR] contact ${contactId}:`, e.response?.data || e.message);
+        console.error(`❌ Ошибка в verifyContact:`, e.response?.data || e.message);
     }
 }
 
-// === WEBHOOK ENDPOINT (Путь как в старом коде) ===
-app.post('/validate-email', async (req, res) => {
-    const body = req.body;
-    const topic = body.topic;
-    const item = body.data?.item;
+app.post('/validate-email', (req, res) => {
+    res.status(200).json({ ok: true });
 
-    if (!item) return res.status(200).send('No item');
+    const item = req.body.data?.item;
+    if (!item) return;
 
-    // Используем ваш старый проверенный способ поиска ID
-    const contactId = item.contacts?.contacts?.[0]?.id || 
-                      item.user?.id || 
-                      item.author?.id ||
+    const contactId = item.user?.id || 
+                      item.contacts?.contacts?.[0]?.id || 
+                      item.author?.id || 
                       (item.type === 'contact' ? item.id : null);
 
-    log(`Webhook: ${topic} | ContactID: ${contactId}`);
-
     if (contactId) {
-        // Запускаем проверку
-        validateAndVerifyContact(contactId);
+        log(`Webhook: ${req.body.topic} для ${contactId}`);
+        verifyContact(contactId);
     }
-
-    res.status(200).json({ ok: true });
 });
 
-// Для проверки жизни сервера
-app.get('/', (req, res) => res.send('Email Verifier is Active'));
-app.head('/validate-email', (req, res) => res.status(200).send('OK'));
+app.get('/', (req, res) => res.send('Verifier v5 is running'));
 
 app.listen(process.env.PORT || 3000, () => {
-    console.log(`🚀 Сервер запущен. Ожидаю вебхуки на /validate-email`);
+    console.log(`🚀 Сервер на связи`);
 });
